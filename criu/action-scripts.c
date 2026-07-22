@@ -158,6 +158,11 @@ int run_scripts(enum script_actions act)
 	return ret;
 }
 
+bool action_scripts_registered(void)
+{
+	return scripts_mode != SCRIPTS_NONE;
+}
+
 int add_script(char *path)
 {
 	struct script *script;

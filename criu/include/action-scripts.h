@@ -1,6 +1,8 @@
 #ifndef __CR_ACTION_SCRIPTS_H__
 #define __CR_ACTION_SCRIPTS_H__
 
+#include <stdbool.h>
+
 #include "asm/int.h"
 
 enum script_actions {
@@ -25,6 +27,15 @@ enum script_actions {
 extern int add_script(char *path);
 extern int add_rpc_notify(int sk);
 extern int run_scripts(enum script_actions);
+/*
+ * Returns true if at least one action script (shell or RPC) is registered
+ * for this restore. Used by callers that skip some restore step on the
+ * assumption an external action script will handle it instead (e.g.
+ * criu/mount.c's is_nvidia_dev_mount() skip) — with nothing registered at
+ * all, that assumption is certainly false and callers should warn loudly
+ * rather than silently proceed as if the skip were harmless.
+ */
+extern bool action_scripts_registered(void);
 extern int rpc_send_fd(enum script_actions, int fd);
 extern int rpc_query_external_files(void);
 extern int exec_rpc_query_external_files(char *name, int sk);

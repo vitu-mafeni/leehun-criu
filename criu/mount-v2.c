@@ -6,6 +6,7 @@
 #include <sys/mount.h>
 #include <sched.h>
 
+#include "action-scripts.h"
 #include "kerndat.h"
 #include "log.h"
 #include "cr_options.h"
@@ -770,9 +771,17 @@ static bool is_invalid_cpu_mount(struct mount_info *mi)
  * device has a different major/minor, so restoring the checkpoint's
  * bind-mount would produce a broken or missing device node.
  *
- * We skip these mounts here because devtmpfs_rebind_gpu_devices()
- * already fixed the device nodes directly inside the /dev tmpfs
- * with the correct rdev from the current host.
+ * We skip these mounts here on the assumption that an external
+ * post-restore action script (contrib/criu-device-restorer/criu-device-restorer.sh
+ * in the CRI-O repo) will bind-mount the correct host device into the
+ * container's /dev after CRIU finishes reconstructing the mount tree.
+ * There is no longer any in-tree CRIU code that fixes these nodes up
+ * itself (the devtmpfs_rebind_gpu_devices() this comment used to
+ * reference was removed) — see is_restore_missing_action_script_warning()
+ * below, which fires a loud warning when nothing registered at all could
+ * possibly do that fixup, so a misconfigured deployment fails
+ * comprehensibly instead of surfacing as a mysterious missing-device error
+ * deep inside a GPU workload.
  */
 static bool is_nvidia_dev_mount(struct mount_info *mi)
 {
@@ -823,15 +832,24 @@ static int do_mount_one_v2(struct mount_info *mi)
 	}
 
 	/*
-	 * Skip bind-mounts for NVIDIA GPU devices under /dev.
-	 * The device nodes have already been fixed up in the parent
-	 * tmpfs/devtmpfs by devtmpfs_rebind_gpu_devices() with the
-	 * correct major/minor from this host.
+	 * Skip bind-mounts for NVIDIA GPU devices under /dev. An external
+	 * post-restore action script is expected to bind-mount the correct
+	 * host device node into place afterward — see is_nvidia_dev_mount()'s
+	 * comment above.
 	 */
 	if (mi->bind && is_nvidia_dev_mount(mi)) {
-		pr_info("mnt-v2: skipping nvidia device mount %d @ %s "
-			"(handled by devtmpfs GPU fixup)\n",
-			mi->mnt_id, mi->ns_mountpoint);
+		if (!action_scripts_registered()) {
+			pr_warn("mnt-v2: skipping nvidia device mount %d @ %s but no "
+				"action-script is registered for this restore — nothing "
+				"will bind-mount the correct host device node into place, "
+				"the container will very likely end up with a missing or "
+				"stale NVIDIA device\n",
+				mi->mnt_id, mi->ns_mountpoint);
+		} else {
+			pr_info("mnt-v2: skipping nvidia device mount %d @ %s "
+				"(handled by post-restore action script)\n",
+				mi->mnt_id, mi->ns_mountpoint);
+		}
 		mi->mounted = true;
 		return 0;
 	}

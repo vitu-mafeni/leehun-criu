@@ -12,7 +12,10 @@
 
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -528,10 +531,216 @@ interrupt:
 	return ret != 0 ? ret : int_ret;
 }
 
+/* Plain key=value config written by CRI-O (internal/lib/gpu_capability.go,
+ * writeGPURemapFiles) alongside the checkpoint image for restore. Kept
+ * separate from CRI-O's own JSON copy (gpu-capability.json) deliberately —
+ * this C tree has no JSON dependency and none should be added for this.
+ */
+#define GPU_CAPABILITY_CONF_FILE "gpu-capability.conf"
+/* Marker file written by the post-restore action script
+ * (contrib/criu-device-restorer/criu-device-restorer.sh in the CRI-O repo)
+ * once it has verified the GPU identity named in gpu-remap.json is actually
+ * present on this host. Its content is "ok" on success, "failed: <reason>"
+ * otherwise.
+ */
+#define GPU_REMAP_STATUS_FILE "gpu-remap-status"
+
+/* Minimal key=value line parser for GPU_CAPABILITY_CONF_FILE. Returns 0 and
+ * sets *out on success, -1 if the file or key doesn't exist.
+ */
+static int gpu_conf_get_long(const char *path, const char *key, long *out)
+{
+	FILE *f;
+	char line[256];
+	size_t keylen = strlen(key);
+
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, key, keylen) == 0 && line[keylen] == '=') {
+			*out = atol(line + keylen + 1);
+			fclose(f);
+			return 0;
+		}
+	}
+	fclose(f);
+	return -1;
+}
+
+static int gpu_conf_get_str(const char *path, const char *key, char *out, size_t out_size)
+{
+	FILE *f;
+	char line[256];
+	size_t keylen = strlen(key);
+
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, key, keylen) == 0 && line[keylen] == '=') {
+			size_t vlen;
+			char *val = line + keylen + 1;
+			/* Strip trailing newline. */
+			vlen = strlen(val);
+			while (vlen > 0 && (val[vlen - 1] == '\n' || val[vlen - 1] == '\r')) {
+				val[vlen - 1] = '\0';
+				vlen--;
+			}
+			strncpy(out, val, out_size - 1);
+			out[out_size - 1] = '\0';
+			fclose(f);
+			return 0;
+		}
+	}
+	fclose(f);
+	return -1;
+}
+
+/* Live-query nvidia-smi for a single field of the given GPU UUID. This
+ * reuses launch_cuda_checkpoint()'s fork/exec/capture plumbing — despite its
+ * name, that helper just runs args[0] and captures its output, which is
+ * exactly what's needed here too. Returns 0 and sets *out_mb on success.
+ */
+static int query_nvidia_smi_field_mb(const char *uuid, const char *field, long *out_mb)
+{
+	char msg_buf[64];
+	char query_arg[64];
+	int ret;
+	const char *args[6];
+
+	snprintf(query_arg, sizeof(query_arg), "--query-gpu=%s", field);
+	args[0] = "nvidia-smi";
+	args[1] = query_arg;
+	args[2] = "--format=csv,noheader,nounits";
+	args[3] = "-i";
+	args[4] = uuid;
+	args[5] = NULL;
+
+	ret = launch_cuda_checkpoint(args, msg_buf, sizeof(msg_buf));
+	if (ret != 0) {
+		pr_warn("nvidia-smi query for %s on GPU %s failed (exit %d): %s\n", field, uuid, ret, msg_buf);
+		return -1;
+	}
+
+	*out_mb = atol(msg_buf);
+	return 0;
+}
+
+/**
+ * cuda_plugin_verify_gpu_capacity - pre-flight guard run before restoring
+ * CUDA device state, in case this restore targets a different GPU
+ * allocation than the one the checkpoint was taken against (see
+ * docs/requirements/checkpoint-restore-gpu-decoupling-design.md §3.2).
+ *
+ * CRI-O already runs the authoritative compatibility check
+ * (validateGPUCapabilityCompatibility, internal/lib/gpu_capability.go)
+ * before CRIU is ever invoked, and the post-restore action script
+ * (criu-device-restorer.sh) verifies the actual device identity before
+ * this hook runs. This function is the belt-and-suspenders check at the
+ * one place CRIU itself can still refuse to hand a checkpointed CUDA
+ * context to a device it was never validated against: right before
+ * calling cuda-checkpoint --action restore.
+ *
+ * Returns 0 (proceed) when:
+ *   - GPU_CAPABILITY_CONF_FILE is absent (this checkpoint predates GCD
+ *     capture, or never held a GPU allocation — nothing to verify), or
+ *   - the recorded high-water-mark VRAM fits within the new allocation
+ *     and GPU_REMAP_STATUS_FILE reads "ok" and the physical card's total
+ *     VRAM is enough to host the new allocation.
+ *
+ * Returns -1 (abort the RESUME_DEVICES_LATE hook, and therefore the
+ * restore) on any other outcome, always via pr_err() so the reason is in
+ * the CRIU restore log rather than a bare CUDA driver failure further on.
+ */
+static int cuda_plugin_verify_gpu_capacity(int pid)
+{
+	const char *image_dir;
+	char conf_path[PATH_MAX];
+	char status_path[PATH_MAX];
+	FILE *status_file;
+	char status_buf[128];
+	long high_water_mark_mb = 0;
+	long new_vram_mb = 0;
+	char new_uuid[128] = "";
+
+	image_dir = getenv("CRTOOLS_IMAGE_DIR");
+	if (!image_dir || !image_dir[0]) {
+		/* No image dir context available — nothing we can check. */
+		return 0;
+	}
+
+	snprintf(conf_path, sizeof(conf_path), "%s/%s", image_dir, GPU_CAPABILITY_CONF_FILE);
+	if (access(conf_path, F_OK) != 0) {
+		/* No GPU Capability Descriptor was captured for this checkpoint. */
+		return 0;
+	}
+
+	/* A GCD exists, so the post-restore action script MUST have run and
+	 * left a verdict — its absence means device remap either did not run
+	 * at all (misconfigured action-script) or the CRTOOLS_IMAGE_DIR the
+	 * script and this hook see somehow diverged. Fail closed either way
+	 * rather than hand a checkpointed CUDA context to an unverified device.
+	 */
+	snprintf(status_path, sizeof(status_path), "%s/%s", image_dir, GPU_REMAP_STATUS_FILE);
+	status_file = fopen(status_path, "r");
+	if (!status_file) {
+		pr_err("%s exists but %s is missing for pid %d — the post-restore GPU "
+		       "device remap did not run or was not configured; refusing to restore "
+		       "CUDA device state onto an unverified device\n",
+		       GPU_CAPABILITY_CONF_FILE, GPU_REMAP_STATUS_FILE, pid);
+		return -1;
+	}
+	if (!fgets(status_buf, sizeof(status_buf), status_file)) {
+		fclose(status_file);
+		pr_err("%s is empty for pid %d\n", GPU_REMAP_STATUS_FILE, pid);
+		return -1;
+	}
+	fclose(status_file);
+
+	if (strncmp(status_buf, "ok", 2) != 0) {
+		pr_err("GPU device remap verification failed for pid %d: %s\n", pid, status_buf);
+		return -1;
+	}
+
+	if (gpu_conf_get_long(conf_path, "high_water_mark_mb", &high_water_mark_mb) != 0)
+		high_water_mark_mb = 0;
+	if (gpu_conf_get_long(conf_path, "new_vram_mb", &new_vram_mb) != 0)
+		new_vram_mb = 0;
+
+	if (high_water_mark_mb > 0 && new_vram_mb > 0 && new_vram_mb < high_water_mark_mb) {
+		pr_err("restore target's GPU allocation (%ld MiB) is smaller than the "
+		       "checkpoint's peak VRAM usage (%ld MiB) for pid %d\n",
+		       new_vram_mb, high_water_mark_mb, pid);
+		return -1;
+	}
+
+	if (gpu_conf_get_str(conf_path, "new_uuid", new_uuid, sizeof(new_uuid)) == 0 && new_uuid[0] && new_vram_mb > 0) {
+		long total_mb = 0;
+
+		if (query_nvidia_smi_field_mb(new_uuid, "memory.total", &total_mb) == 0 && total_mb > 0 && new_vram_mb > total_mb) {
+			pr_err("restore target's allocation (%ld MiB) exceeds GPU %s's total VRAM "
+			       "(%ld MiB) for pid %d — live nvidia-smi query\n",
+			       new_vram_mb, new_uuid, total_mb, pid);
+			return -1;
+		}
+	}
+
+	pr_info("GPU capacity verified for pid %d: high_water_mark_mb=%ld new_vram_mb=%ld\n", pid,
+		high_water_mark_mb, new_vram_mb);
+	return 0;
+}
+
 int cuda_plugin_resume_devices_late(int pid)
 {
 	if (plugin_disabled) {
 		return -ENOTSUP;
+	}
+
+	if (cuda_plugin_verify_gpu_capacity(pid)) {
+		return -1;
 	}
 
 	/* RESUME_DEVICES_LATE is used during `criu restore`.
