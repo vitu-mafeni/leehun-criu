@@ -1,3 +1,4 @@
+#include <sys/sysmacros.h>
 #include "criu-log.h"
 #include "plugin.h"
 #include "util.h"
@@ -403,6 +404,40 @@ int cuda_plugin_checkpoint_devices(int pid)
 	int_ret = interrupt_restore_thread(restore_tid, &save_sigset);
 	return status != 0 ? -1 : int_ret;
 }
+static int cuda_plugin_handle_device_vma(int fd, const struct stat *st_buf)
+{
+	char fdpath[64], devpath[PATH_MAX];
+	ssize_t len;
+	int ret;
+
+	snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+	len = readlink(fdpath, devpath, sizeof(devpath) - 1);
+	if (len < 0) {
+		pr_perror("readlink %s failed", fdpath);
+		return -errno;
+	}
+	devpath[len] = '\0';
+
+	if (!strstr(devpath, "nvidia")) {
+		pr_debug("CUDA plugin: not an NVIDIA device: %s\n", devpath);
+		return -ENOTSUP;
+	}
+
+	pr_info("CUDA plugin: recognized NVIDIA device VMA at %s\n", devpath);
+
+	if (!plugin_added_to_inventory) {
+		ret = add_inventory_plugin(CR_PLUGIN_DESC.name);
+		if (ret) {
+			pr_err("Failed to add CUDA plugin to inventory image\n");
+			return ret;
+		}
+		plugin_added_to_inventory = true;
+	}
+
+	return 0;
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA, cuda_plugin_handle_device_vma)
+
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES, cuda_plugin_checkpoint_devices);
 
 int cuda_plugin_pause_devices(int pid)
@@ -732,6 +767,75 @@ static int cuda_plugin_verify_gpu_capacity(int pid)
 		high_water_mark_mb, new_vram_mb);
 	return 0;
 }
+
+static int cuda_plugin_dump_file(int fd, int id)
+{
+        char proc_path[PATH_MAX];
+        char dev_path[PATH_MAX];
+        char img_path[PATH_MAX];
+        ssize_t len;
+        int img_fd;
+
+        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+        len = readlink(proc_path, dev_path, sizeof(dev_path) - 1);
+        if (len < 0)
+                return -ENOTSUP;
+        dev_path[len] = '\0';
+
+        if (strncmp(dev_path, "/dev/nvidia", 11) != 0)
+                return -ENOTSUP;
+
+        pr_info("Dumping NVIDIA char dev fd %d -> %s (id=%d)\n", fd, dev_path, id);
+
+        snprintf(img_path, sizeof(img_path), "/tmp/criu-nvidia-fd-%d", id);
+        img_fd = open(img_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (img_fd < 0) {
+                pr_perror("Failed to create %s", img_path);
+                return -1;
+        }
+        if (write(img_fd, dev_path, len) != len) {
+                pr_perror("Failed to write to %s", img_path);
+                close(img_fd);
+                return -1;
+        }
+        close(img_fd);
+        return 0;
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__DUMP_EXT_FILE, cuda_plugin_dump_file)
+
+static int cuda_plugin_restore_file(int id, bool *retry_needed)
+{
+        char img_path[PATH_MAX];
+        char dev_path[PATH_MAX];
+        ssize_t len;
+        int img_fd, dev_fd;
+
+        *retry_needed = false;
+
+        snprintf(img_path, sizeof(img_path), "/tmp/criu-nvidia-fd-%d", id);
+        img_fd = open(img_path, O_RDONLY);
+        if (img_fd < 0)
+                return -ENOTSUP;
+
+        len = read(img_fd, dev_path, sizeof(dev_path) - 1);
+        close(img_fd);
+        if (len <= 0) {
+                pr_perror("Failed to read from %s", img_path);
+                return -1;
+        }
+        dev_path[len] = '\0';
+
+        pr_info("Restoring NVIDIA char dev fd id=%d from %s\n", id, dev_path);
+
+        dev_fd = open(dev_path, O_RDWR | O_NOCTTY);
+        if (dev_fd < 0) {
+                pr_perror("Failed to open %s", dev_path);
+                return -1;
+        }
+        return dev_fd;
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESTORE_EXT_FILE, cuda_plugin_restore_file)
+
 
 int cuda_plugin_resume_devices_late(int pid)
 {
